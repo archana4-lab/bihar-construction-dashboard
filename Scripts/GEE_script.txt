@@ -1,0 +1,96 @@
+/**
+ * GIS Analyst Assignment: District-Wise New Construction Activity in Bihar (2021-2026)
+ * Platform: Google Earth Engine (GEE) Code Editor
+ * Description: Automatically clips and exports construction rasters district-by-district 
+ *              using your custom uploaded district asset and 'district' property.
+ */
+
+// 1. Load Your Custom Districts Asset
+var districts = ee.FeatureCollection('projects/analog-receiver-513107-h7/assets/Bihar_dist');
+
+// Automatically create the state boundary (bihar) by dissolving the district boundaries
+var bihar = districts.geometry().dissolve();
+
+Map.centerObject(bihar, 7);
+Map.addLayer(bihar, {color: 'red'}, 'Bihar State Boundary', false);
+
+// 2. Cloud Masking Function for Sentinel-2 SR
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// 3. Permanent Water Mask (JRC Global Surface Water)
+var jrcWater = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').select('occurrence');
+var permanentWaterMask = jrcWater.lt(20); // Exclude permanent water bodies
+
+// 4. Function to Generate Annual Post-Monsoon Composite (Oct 1 - Dec 31)
+function getAnnualComposite(year, regionGeometry) {
+  var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(regionGeometry)
+    .filterDate(year + '-10-01', year + '-12-31')
+    .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 15))
+    .map(maskS2clouds);
+    
+  var composite = s2.median().clip(regionGeometry);
+  var ndbi = composite.normalizedDifference(['B11', 'B8']).rename('NDBI');
+  var ndvi = composite.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return composite.addBands(ndbi).addBands(ndvi);
+}
+
+// 5. Establish 2021 Baseline Composite for the state
+print('Processing 2021 baseline composite...');
+var baseline2021 = getAnnualComposite(2021, bihar);
+var baselineNDBI = baseline2021.select('NDBI');
+
+// 6. Select Target Year (Change this to 2022, 2023, 2024, 2025, or 2026 as needed)
+var targetYear = 2022;
+print('Processing target year: ' + targetYear);
+
+var compTarget = getAnnualComposite(targetYear, bihar);
+var ndbiTarget = compTarget.select('NDBI');
+var ndviTarget = compTarget.select('NDVI');
+
+// Change Detection & False Positive Filtering Logic
+var ndbiDiff = ndbiTarget.subtract(baselineNDBI);
+var potentialConst = ndbiDiff.gt(0.12); // NDBI threshold for structural change
+var notAgriculture = ndviTarget.lt(0.35); // Suppress crop/vegetation swings
+
+var constructionMask = potentialConst
+  .and(notAgriculture)
+  .and(permanentWaterMask)
+  .rename('construction_' + targetYear);
+
+// 7. Iterate Through Each District and Queue Export Tasks
+districts.evaluate(function(fc) {
+  if (!fc) return;
+  fc.features.forEach(function(feat) {
+    var props = feat.properties;
+    
+    // Fetches district name directly from your shapefile's 'district' column
+    var distName = props.district || 'Unknown_District'; 
+    
+    var distGeometry = ee.Feature(feat).geometry();
+    
+    // Clip the construction raster to this specific district boundary
+    var clippedRaster = constructionMask.clip(distGeometry).toByte();
+    
+    // Clean string for task description (removes spaces/special characters)
+    var safeName = String(distName).replace(/[^a-zA-Z0-9]/g, '_');
+    
+    // Queue Export Task
+    Export.image.toDrive({
+      image: clippedRaster,
+      description: 'District_Const_' + safeName + '_' + targetYear,
+      folder: 'GEE_District_Exports_'+targetYear,
+      scale: 20,
+      region: distGeometry,
+      maxPixels: 1e9
+    });
+  });
+  print('All district export tasks for ' + targetYear + ' have been generated! Check your Tasks tab.');
+});
