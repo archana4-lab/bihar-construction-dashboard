@@ -1,0 +1,67 @@
+import geopandas as gpd
+import pandas as pd
+import os
+
+# ---------- CONFIG ----------
+SHP = "D:/Bihar_dashboard/input/boundaries/Bihar_village_simplified.shp"
+IN = "D:/Bihar_Construction/04_outputs3"        # new ranking CSVs
+OUT = "D:/Bihar_dashboard/data"
+VILLAGE_KEY_SHP = "id"
+YEARS = [2022, 2023, 2024, 2025, 2026]
+# ----------------------------
+
+YC = [f"y{y}" for y in YEARS]
+os.makedirs(OUT, exist_ok=True)
+
+def norm(s):
+    return s.fillna("").astype(str).str.strip().str.lower()
+
+def clean_id(s):
+    return s.astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+
+def tidy(c, rank_col):
+    # short, consistent property names for the web page
+    c = c.rename(columns={"CAS": "score", "total_const_ha": "area",
+                          "growth_velocity": "growth", rank_col: "rank"})
+    return c.drop(columns=[x for x in c.columns if x.startswith("r") and x[1:].isdigit()])
+
+def save(g, level):
+    num = [c for c in g.columns if c != "geometry" and pd.api.types.is_float_dtype(g[c])]
+    g[num] = g[num].round(1)
+    path = f"{OUT}/{level}.geojson"
+    g.to_file(path, driver="GeoJSON", COORDINATE_PRECISION=4)
+    print(f"{level}: {len(g)} features, {os.path.getsize(path)/1e6:.1f} MB, "
+          f"unmatched = {g['score'].isna().sum()}")
+
+gdf = gpd.read_file(SHP).to_crs(4326)
+gdf["geometry"] = gdf.geometry.buffer(0)
+gdf["d_key"] = norm(gdf["district"])
+gdf["s_key"] = gdf["d_key"] + "|" + norm(gdf["subdistric"])
+
+# ---------- DISTRICTS ----------
+g = gdf[["d_key", "district", "geometry"]].dissolve(by="d_key", aggfunc="first", as_index=False)
+g["geometry"] = g.geometry.simplify(0.002)
+c = tidy(pd.read_csv(f"{IN}/District_Rankings.csv"), "District_Rank")
+c["d_key"] = norm(c["district"])
+g = g.merge(c.drop(columns="district"), on="d_key", how="left").rename(columns={"district": "name"})
+save(g.drop(columns="d_key"), "districts")
+
+# ---------- SUB-DISTRICTS ----------
+g = gdf[["s_key", "district", "subdistric", "geometry"]].dissolve(by="s_key", aggfunc="first", as_index=False)
+g["geometry"] = g.geometry.simplify(0.001)
+c = tidy(pd.read_csv(f"{IN}/Subdistrict_Rankings.csv"), "SubDistrict_Rank")
+c["s_key"] = norm(c["district"]) + "|" + norm(c["sub_district"])
+c = c.drop(columns=["district", "sub_district"])
+g = g.merge(c, on="s_key", how="left").rename(columns={"subdistric": "name"})
+save(g.drop(columns="s_key"), "subdistricts")
+
+# ---------- VILLAGES (points) ----------
+g = gdf[[VILLAGE_KEY_SHP, "geometry"]].copy()
+g["geometry"] = g.geometry.representative_point()
+g["vkey"] = clean_id(g[VILLAGE_KEY_SHP])
+print("Duplicate village ids in shapefile:", g["vkey"].duplicated().sum())   # should be 0
+c = tidy(pd.read_csv(f"{IN}/Village_Rankings.csv"), "Village_Rank")
+c["vkey"] = clean_id(c["village_id"])
+c = c.drop(columns=["village_id"]).rename(columns={"village_name": "name"})
+g = g[["vkey", "geometry"]].merge(c, on="vkey", how="left")
+save(g.drop(columns="vkey"), "villages")
