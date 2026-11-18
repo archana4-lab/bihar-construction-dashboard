@@ -1,0 +1,221 @@
+from pathlib import Path
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import rasterio
+from scipy import ndimage
+from rasterstats import zonal_stats
+
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+BASE_DIR = Path("D:/Bihar_Construction")
+BASE_RASTER_DIR = BASE_DIR / "02_processed" / "GEE_rasters"
+VECTOR_PATH = BASE_DIR / "01_inputs" / "boundaries" / "Bihar_village_simplified.shp"
+OUTPUT_DIR = BASE_DIR / "04_outputs3"          # new folder, so the old outputs stay for comparison
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TARGET_YEARS = [2022, 2023, 2024, 2025, 2026]  # years read from the rasters
+SCORE_YEARS = [2022, 2023, 2024, 2025]         # years used for total, trend and CAS (2026 is provisional)
+
+# False-positive filters
+MIN_PIXELS = 3            # drop speckle smaller than 3 connected pixels
+MAX_HA = 10               # drop field-scale blocks larger than 10 ha
+USE_PERSISTENCE = True    # change must still be flagged the following year (not testable for 2026)
+
+# Score weights
+W_TOTAL, W_GROWTH = 0.7, 0.3
+
+TEST_DISTRICTS = None     # e.g. ["Samastipur", "Patna"] for a quick test; None = all districts
+
+print(">>> Loading village shapefile...")
+villages_gdf = gpd.read_file(VECTOR_PATH)
+if villages_gdf.crs != "EPSG:4326":
+    villages_gdf = villages_gdf.to_crs("EPSG:4326")
+BIHAR_AREA_HA = villages_gdf.to_crs(6933).area.sum() / 10000.0
+
+# ==========================================
+# 2. FILTER RASTERS AND SUMMARISE PER VILLAGE
+# ==========================================
+def find_raster(year, dist):
+    folder = BASE_RASTER_DIR / f"GEE_District_Exports_{year}"
+    name = str(dist).strip()
+    alt = name.replace("(", "_").replace(")", "_").replace(" ", "_")
+    for n in (name, alt):
+        hits = list(folder.glob(f"District_Const*{n}*{year}.tif"))
+        if hits:
+            return hits[0]
+    return None
+
+def pixel_area_sqm(src):
+    # real pixel area from the raster's own resolution and latitude
+    lat = (src.bounds.top + src.bounds.bottom) / 2
+    dx = src.res[0] * 111320 * np.cos(np.radians(lat))
+    dy = src.res[1] * 110574
+    return dx * dy
+
+rows, diag, problems = [], [], []
+districts = [d for d in villages_gdf['district'].unique()
+             if TEST_DISTRICTS is None or d in TEST_DISTRICTS]
+
+for dist in districts:
+    print(f"\n--- {dist} ---")
+    paths = {y: find_raster(y, dist) for y in TARGET_YEARS}
+    missing = [y for y in TARGET_YEARS if paths[y] is None]
+    if missing:
+        print(f"  [Warning] rasters missing for years {missing}. District skipped.")
+        problems.append((dist, f"missing years {missing}"))
+        continue
+
+    flags, transform, shape, pix_area = {}, None, None, None
+    for y in TARGET_YEARS:
+        with rasterio.open(paths[y]) as src:
+            flags[y] = src.read(1) > 0
+            if transform is None:
+                transform, shape, pix_area = src.transform, flags[y].shape, pixel_area_sqm(src)
+    if any(f.shape != shape for f in flags.values()):
+        print("  [Warning] rasters have different shapes across years. District skipped.")
+        problems.append((dist, "shape mismatch"))
+        continue
+
+    max_pix = int(MAX_HA * 10000 / pix_area)
+    to_ha = pix_area / 10000.0
+    dist_villages = villages_gdf[villages_gdf['district'] == dist].copy()
+    cum = np.zeros(shape, dtype=bool)            # everything flagged in earlier years
+
+    for i, y in enumerate(TARGET_YEARS):
+        cand = flags[y] & ~cum                   # filter 1: first-detection rule
+        first_px = int(cand.sum())
+        if USE_PERSISTENCE and i < len(TARGET_YEARS) - 1:
+            cand &= flags[TARGET_YEARS[i + 1]]   # filter 2: persistence
+        pers_px = int(cand.sum())
+
+        lab, _ = ndimage.label(cand)             # filter 3: patch size
+        sizes = np.bincount(lab.ravel())
+        keep = (sizes >= MIN_PIXELS) & (sizes <= max_pix)
+        keep[0] = False
+        clean = keep[lab]
+        cum |= flags[y]
+
+        stats = zonal_stats(dist_villages, clean.astype("uint8"), affine=transform,
+                            stats="sum", nodata=0, all_touched=False)
+
+        tmp = dist_villages[['id', 'village', 'subdistric', 'district']].copy()
+        tmp.columns = ['village_id', 'village_name', 'sub_district', 'district']
+        tmp['year'] = y
+        tmp['const_area_ha'] = [(s.get('sum') or 0) * to_ha for s in stats]
+        rows.append(tmp)
+
+        diag.append({'district': dist, 'year': y,
+                     'raw_flagged_ha': flags[y].sum() * to_ha,
+                     'after_first_detection_ha': first_px * to_ha,
+                     'after_persistence_ha': pers_px * to_ha,
+                     'final_ha': clean.sum() * to_ha})
+        print(f"  {y}: raw {flags[y].sum()*to_ha:,.0f} ha -> final {clean.sum()*to_ha:,.0f} ha")
+
+if not rows:
+    raise ValueError("Nothing was processed. Check paths and file names.")
+
+master_village_df = pd.concat(rows, ignore_index=True)
+diag_df = pd.DataFrame(diag)
+diag_df.to_csv(OUTPUT_DIR / "FalsePositive_Filter_Diagnostics.csv", index=False)
+master_village_df.to_csv(OUTPUT_DIR / "Village_Yearly_Long.csv", index=False)
+
+# ==========================================
+# 3. YEARLY TABLE + SCORE
+# ==========================================
+print("\n>>> Building yearly table and CAS...")
+YEARS = sorted(master_village_df['year'].unique())
+YCOLS = [f"y{y}" for y in YEARS]                  # all years shown in the outputs
+RCOLS = [f"r{y}" for y in YEARS]                  # yearly ranks
+SCYCOLS = [f"y{y}" for y in SCORE_YEARS]          # years used in the score
+ID_COLS = ['village_id', 'village_name', 'sub_district', 'district']
+
+village = master_village_df.pivot_table(index=ID_COLS, columns='year',
+                                        values='const_area_ha', aggfunc='sum', fill_value=0)
+village.columns = [f"y{y}" for y in village.columns]
+village = village.reset_index()
+
+def growth_slope(df):
+    # trend in hectares per year over the scoring years
+    Y = df[SCYCOLS].to_numpy(dtype=float)
+    xc = np.array(SCORE_YEARS, dtype=float) - np.mean(SCORE_YEARS)
+    return ((Y - Y.mean(axis=1, keepdims=True)) @ xc) / (xc ** 2).sum()
+
+village['total_const_ha'] = village[SCYCOLS].sum(axis=1)
+village['growth_velocity'] = growth_slope(village)
+village['CAS'] = (village['total_const_ha'] * W_TOTAL
+                  + village['growth_velocity'].clip(lower=0) * W_GROWTH)
+
+# ==========================================
+# 4. AGGREGATION TO SUB-DISTRICT AND DISTRICT
+# ==========================================
+def aggregate(by):
+    agg = {c: 'sum' for c in YCOLS}
+    agg['CAS'] = 'sum'                            # sum of village scores
+    out = village.groupby(by, as_index=False).agg(agg)
+    out['total_const_ha'] = out[SCYCOLS].sum(axis=1)
+    out['growth_velocity'] = growth_slope(out)
+    return out
+
+subdistrict = aggregate(['district', 'sub_district'])
+district = aggregate(['district'])
+
+# ==========================================
+# 5. RANKS: ONE PER YEAR + FINAL RANK
+# ==========================================
+def add_ranks(df, final_rank_col):
+    for y in YEARS:
+        df[f"r{y}"] = df[f"y{y}"].rank(method="min", ascending=False).astype(int)
+    df = df.sort_values('CAS', ascending=False).reset_index(drop=True)
+    df[final_rank_col] = df.index + 1
+    return df
+
+village = add_ranks(village, 'Village_Rank')
+subdistrict = add_ranks(subdistrict, 'SubDistrict_Rank')
+district = add_ranks(district, 'District_Rank')
+
+def order(df, ids, final_rank_col):
+    return df[ids + YCOLS + ['total_const_ha', 'growth_velocity', 'CAS'] + RCOLS + [final_rank_col]]
+
+village = order(village, ID_COLS, 'Village_Rank').round(2)
+subdistrict = order(subdistrict, ['district', 'sub_district'], 'SubDistrict_Rank').round(2)
+district = order(district, ['district'], 'District_Rank').round(2)
+
+# ==========================================
+# 6. EXPORT
+# ==========================================
+village.to_csv(OUTPUT_DIR / "Village_Rankings.csv", index=False)
+subdistrict.to_csv(OUTPUT_DIR / "Subdistrict_Rankings.csv", index=False)
+district.to_csv(OUTPUT_DIR / "District_Rankings.csv", index=False)
+try:
+    with pd.ExcelWriter(OUTPUT_DIR / "Bihar_Construction_Rankings.xlsx") as xw:
+        district.to_excel(xw, sheet_name="District", index=False)
+        subdistrict.to_excel(xw, sheet_name="Sub-district", index=False)
+        village.to_excel(xw, sheet_name="Village", index=False)
+except ModuleNotFoundError:
+    print("openpyxl not installed, Excel file skipped (CSVs saved).")
+
+# ==========================================
+# 7. SUMMARY AND SANITY CHECKS
+# ==========================================
+print("\n>>> Done. Saved in:", OUTPUT_DIR.resolve())
+print(f"Districts: {len(district)} | Sub-districts: {len(subdistrict)} | Villages: {len(village)}")
+print(f"Scoring years: {SCORE_YEARS} | 2026 is shown but provisional")
+
+if problems:
+    print("\n[CHECK] Districts with problems (fix before trusting the ranks):")
+    for d, why in problems:
+        print("  ", d, "-", why)
+else:
+    print("\nAll districts processed for all years.")
+
+print("\nBihar-wide effect of each filter (ha):")
+print(diag_df.groupby('year')[['raw_flagged_ha', 'after_first_detection_ha',
+                                'after_persistence_ha', 'final_ha']].sum().round(0).to_string())
+print(f"\nFinal {SCORE_YEARS[0]}-{SCORE_YEARS[-1]} total = "
+      f"{district['total_const_ha'].sum() / BIHAR_AREA_HA * 100:.2f}% of Bihar's area")
+print(f"Villages with zero total: {(village['total_const_ha'] == 0).sum()} of {len(village)}")
+
+print("\nTop 5 districts:")
+print(district[['district', 'total_const_ha', 'CAS', 'District_Rank']].head().to_string(index=False))
